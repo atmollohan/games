@@ -1,0 +1,39 @@
+name: pr-checks
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Validate PR title follows Conventional Commits
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          if ! echo "$PR_TITLE" | grep -qE \
+            '^(feat|fix|docs|style|refactor|perf|test|chore|ci|build|revert)(\([^()]+\))?!?:\s.+'; then
+            echo "::error::PR title does not follow Conventional Commits format."
+            echo "::error::Expected: <type>(<scope>)!: <description>"
+            echo "::error::Types: feat, fix, docs, style, refactor, perf, test, chore, ci, build, revert"
+            echo "::error::Examples:"
+            echo "::error::  feat: add new feature"
+            echo "::error::  fix(api): handle edge case"
+            echo "::error::  docs: update README"
+            exit 1
+          fi
+          echo "PR title follows Conventional Commits: ${PR_TITLE}"
+
+      - name: Python syntax check
+        run: python3 -m py_compile server.py
+
+      - name: Lint with ruff
+        uses: astral-sh/ruff-action@v3

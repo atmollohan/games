@@ -1,0 +1,81 @@
+name: deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: Image tag to deploy (defaults to latest)
+        required: false
+        type: string
+        default: latest
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PI_HOSTNAME: rpi3
+  PI_USER: mollopi5
+  APP_DIR: /home/mollopi5/projects/games
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set image full name
+        id: image
+        run: |
+          TAG="${{ github.event.inputs.image_tag || 'latest' }}"
+          echo "image_full=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${TAG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Deploy app on Pi
+        run: |
+          tailscale ssh "${{ env.PI_USER }}@${{ env.PI_HOSTNAME }}" "
+            set -e
+            mkdir -p ${{ env.APP_DIR }}
+
+            echo 'c2VydmljZXM6CiAgZ2FtZXM6CiAgICBpbWFnZTogTUFHX1BMQUNFSE9MREVSCiAgICBjb250YWluZXJfbmFtZTogZ2FtZXMKICAgIHJlc3RhcnQ6IHVubGVzcy1zdG9wcGVkCiAgICBwb3J0czoKICAgICAgLSAiODAwMTo4MDAxIgogICAgaGVhbHRoY2hlY2s6CiAgICAgIHRlc3Q6IFsnQ01EJywgJ3dnZXQnLCAnLXFPLScsICdodHRwOi8vbG9jYWxob3N0OjgwMDEvaGVhbHRoJ10KICAgICAgaW50ZXJ2YWw6IDMwcwogICAgICB0aW1lb3V0OiAzcwogICAgICByZXRyaWVzOiAzCgogIHR1bm5lbDoKICAgIGltYWdlOiBjbG91ZGZsYXJlL2Nsb3VkZmxhcmVkOmxhdGVzdAogICAgY29udGFpbmVyX25hbWU6IGdhbWVzLXR1bm5lbAogICAgcmVzdGFydDogdW5sZXNzLXN0b3BwZWQKICAgIGNvbW1hbmQ6IHR1bm5lbCAtLW5vLWF1dG91cGRhdGUgcnVuCiAgICBlbnZpcm9ubWVudDoKICAgICAgLSBUVU5ORUxfVE9LRU49JHtUVU5ORUxfVE9LRU59Cg==' | base64 -d | sed 's/MAG_PLACEHOLDER/${{ steps.image.outputs.image_full }}/g' > ${{ env.APP_DIR }}/docker-compose.yml
+
+            echo '${{ secrets.GHCR_PAT }}' | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+            docker compose -f ${{ env.APP_DIR }}/docker-compose.yml pull
+            docker compose -f ${{ env.APP_DIR }}/docker-compose.yml up -d
+            echo 'Verifying container...'
+            docker ps --filter name=games --format '{{.Status}}'
+          "
+          echo "Deploy complete"
+
+      - name: Verify health
+        run: |
+          sleep 15
+          tailscale ssh "${{ env.PI_USER }}@${{ env.PI_HOSTNAME }}" "
+            CONTAINER=games
+            status=\$(docker inspect -f '{{.State.Status}}' \$CONTAINER 2>/dev/null)
+            restart_count=\$(docker inspect -f '{{.RestartCount}}' \$CONTAINER 2>/dev/null)
+            echo \"Container status: \$status\"
+            echo \"Restart count: \$restart_count\"
+            if [ \"\$status\" != \"running\" ]; then
+              echo 'ERROR: Container is not running'
+              docker logs \$CONTAINER --tail 20
+              exit 1
+            fi
+            if [ \"\$restart_count\" -gt 3 ]; then
+              echo 'ERROR: Container in restart loop'
+              docker logs \$CONTAINER --tail 20
+              exit 1
+            fi
+            echo 'App is healthy'
+          "
+
+      - name: Deployment summary
+        run: |
+          echo "=== Deployment Complete ==="
+          echo "Image: ${{ steps.image.outputs.image_full }}"
+          echo "Target: ${{ env.PI_HOSTNAME }}"

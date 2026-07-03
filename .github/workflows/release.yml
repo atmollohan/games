@@ -1,0 +1,388 @@
+---
+# Release flow:
+# 1. Manual trigger (workflow_dispatch, optional dry_run input)
+# 2. Auto-detect version bump — checks PR semver labels first, then falls
+#    back to conventional commit analysis.
+# 3. Guard against no changes since last release
+# 4. Create git tag, GitHub release, and trigger Docker build + deploy
+#
+# Version bump priority:
+#   0. Manual version_override input (if provided, skips all auto-detection)
+#   1. PR semver:major / semver:minor / semver:patch labels (highest wins)
+#   2. Conventional commits: BREAKING CHANGE or !: = major, feat: = minor
+#   3. Default: patch
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_override:
+        description: >-
+          Optional explicit semver (e.g. "v0.2.0" or "0.2.0"). If set, uses
+          this version directly instead of auto-detecting from labels/commits.
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: >-
+          If true, computes version and shows release notes preview without
+          creating a tag, release, or deploying.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+  contents: write
+  packages: write
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PI_HOSTNAME: rpi3
+  PI_USER: mollopi5
+  APP_DIR: /home/mollopi5/projects/games
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Compute version bump
+        id: version
+        run: |
+          override="${{ github.event.inputs.version_override }}"
+
+          if [ -n "$override" ]; then
+            override="${override#v}"
+            if ! echo "$override" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "::error::Invalid version override \"${override}\". Expected semver (e.g. 0.2.0 or v0.2.0)."
+              exit 1
+            fi
+            new_version="$override"
+            release_tag="v${override}"
+            last_tag=$(git tag --sort=-v:refname | head -n1 2>/dev/null || echo "")
+            echo "Using manual version: ${release_tag}"
+            echo "version=${new_version}" >> "$GITHUB_OUTPUT"
+            echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+            echo "last_tag=${last_tag}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          last_tag=$(git tag --sort=-v:refname | head -n1 2>/dev/null || echo "")
+
+          if [ -z "$last_tag" ]; then
+            commits=$(git log --oneline)
+            log_range=""
+          else
+            commits=$(git log --oneline ${last_tag}..HEAD)
+            log_range="${last_tag}..HEAD"
+          fi
+
+          if [ -z "$commits" ]; then
+            echo "::error::No changes since last release (${last_tag}). Aborting release."
+            exit 1
+          fi
+
+          bump="patch"
+          semver_source="conventional-commits"
+
+          pr_numbers=$(echo "$commits" | grep -oP '#\K\d+' | sort -u)
+
+          if [ -n "$pr_numbers" ]; then
+            echo "Found PRs: $(echo "$pr_numbers" | tr '\n' ' ')"
+            semver_major=0
+            semver_minor=0
+            for pr in $pr_numbers; do
+              labels=$(gh api "repos/${{ github.repository }}/issues/$pr/labels" \
+                --jq '.[].name' 2>/dev/null || echo "")
+              if echo "$labels" | grep -q "semver:major"; then
+                semver_major=1
+                echo "  PR #$pr → semver:major"
+              elif echo "$labels" | grep -q "semver:minor"; then
+                semver_minor=1
+                echo "  PR #$pr → semver:minor"
+              fi
+            done
+            if [ $semver_major -eq 1 ]; then
+              bump="major"
+              semver_source="pr-labels"
+            elif [ $semver_minor -eq 1 ]; then
+              bump="minor"
+              semver_source="pr-labels"
+            fi
+          fi
+
+          if [ "$bump" = "patch" ]; then
+            has_major=0
+            has_minor=0
+
+            if [ -z "$last_tag" ]; then
+              breaking=$(git log --format="%B" | grep -E 'BREAKING CHANGE' || true)
+            else
+              breaking=$(git log ${log_range} --format="%B" | grep -E 'BREAKING CHANGE' || true)
+            fi
+            if [ -n "$breaking" ] || echo "$commits" | grep -qE '!:' ; then
+              has_major=1
+            fi
+
+            if echo "$commits" | grep -qE '^[a-f0-9]+ feat:' ; then
+              has_minor=1
+            fi
+
+            if [ $has_major -eq 1 ]; then
+              bump="major"
+            elif [ $has_minor -eq 1 ]; then
+              bump="minor"
+            fi
+          fi
+
+          echo "Bump: ${bump} (source: ${semver_source})"
+
+          if [ -z "$last_tag" ]; then
+            new_version="0.1.0"
+          else
+            version_num=${last_tag#v}
+            IFS='.' read -r major minor patch <<< "$version_num"
+            case $bump in
+              major) new_version="$((major + 1)).0.0" ;;
+              minor) new_version="${major}.$((minor + 1)).0" ;;
+              patch) new_version="${major}.${minor}.$((patch + 1))" ;;
+            esac
+          fi
+
+          release_tag="v${new_version}"
+          echo "version=${new_version}" >> "$GITHUB_OUTPUT"
+          echo "release_tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "last_tag=${last_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: release_state
+        run: |
+          release_tag="${{ steps.version.outputs.release_tag }}"
+          if gh release view "${release_tag}" >/dev/null 2>&1; then
+            if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+              echo "::warning::Release ${release_tag} already exists — would fail on real run."
+            else
+              echo "::error::Release ${release_tag} already exists!"
+              exit 1
+            fi
+          else
+            echo "Release ${release_tag} does not exist - ready to create"
+          fi
+
+      - name: Create and push tag
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          release_tag="${{ steps.version.outputs.release_tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$release_tag" -m "Release $release_tag"
+          git push origin "$release_tag"
+          echo "Pushed tag: ${release_tag}"
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          current_tag="${{ steps.version.outputs.release_tag }}"
+          previous_tag="${{ steps.version.outputs.last_tag }}"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          commits_file="$RUNNER_TEMP/commits.json"
+
+          if [ -n "$previous_tag" ]; then
+            gh api "repos/${{ github.repository }}/compare/${previous_tag}...${current_tag}" \
+              --jq '.commits | map({message: .commit.message, sha: .sha, login: (.author.login // "unknown")})' \
+              > "$commits_file" 2>/dev/null || echo "[]" > "$commits_file"
+          else
+            gh api "repos/${{ github.repository }}/commits?per_page=15" \
+              --jq 'map({message: .commit.message, sha: .sha, login: (.author.login // "unknown")})' \
+              > "$commits_file" 2>/dev/null || echo "[]" > "$commits_file"
+          fi
+
+          {
+            echo "# ${current_tag}"
+            echo
+            if [[ -n "$previous_tag" ]] && [[ "$previous_tag" != "$current_tag" ]]; then
+              echo "Changes since ${previous_tag}."
+              echo
+              echo "**Compare:** [${previous_tag}...${current_tag}](https://github.com/${{ github.repository }}/compare/${previous_tag}...${current_tag})"
+              echo
+            else
+              echo "Initial release"
+              echo
+            fi
+
+            contributors=$(jq -r 'map(.login) | unique | join(", ")' "$commits_file")
+
+            for spec in "feat:New Features" "fix:Bug Fixes" "docs:Documentation" "refactor:Refactoring" "test:Testing" "chore:Chores" "other:Other Changes"; do
+              IFS=':' read -r prefix heading <<< "$spec"
+              if [ "$prefix" = "other" ]; then
+                entries=$(jq -r '
+                  .[] | select(.message |
+                    test("^(feat|fix|docs|refactor|test|chore)(\\(.+\\))?!?:") | not) |
+                  "- " + (.message | gsub("\n"; " ") | split(" ")[0:12] | join(" ")) +
+                  " ([@" + .login + "](https://github.com/" + .login +
+                  ")), [" + (.sha[0:7]) +
+                  "](https://github.com/${{ github.repository }}/commit/" + .sha + ")"
+                ' "$commits_file")
+              else
+                entries=$(jq -r --arg p "^${prefix}(\\(.+\\))?!?:" '
+                  .[] | select(.message | test($p)) |
+                  "- " + (.message | gsub("\n"; " ") | split(" ")[0:12] | join(" ")) +
+                  " ([@" + .login + "](https://github.com/" + .login +
+                  ")), [" + (.sha[0:7]) +
+                  "](https://github.com/${{ github.repository }}/commit/" + .sha + ")"
+                ' "$commits_file")
+              fi
+              if [[ -n "$entries" ]]; then
+                echo "### ${heading}"
+                echo "$entries"
+                echo
+              fi
+            done
+
+            if [[ -n "$contributors" ]] && [[ "$contributors" != "null" ]]; then
+              echo "## Contributors"
+              echo "$contributors"
+            fi
+          } > "${notes_file}"
+
+          echo "file=${notes_file}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        if: github.event.inputs.dry_run != 'true'
+        run: |
+          gh release create "${{ steps.version.outputs.release_tag }}" \
+            --title "${{ steps.version.outputs.release_tag }}" \
+            --notes-file "${{ steps.notes.outputs.file }}"
+
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.version.outputs.release_tag }}
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+
+      - name: Deploy app on Pi
+        run: |
+          tailscale ssh "${{ env.PI_USER }}@${{ env.PI_HOSTNAME }}" "
+            set -e
+            mkdir -p ${{ env.APP_DIR }}
+
+            echo 'services:
+              games:
+                image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
+                container_name: games
+                restart: unless-stopped
+                ports:
+                  - \"8001:8001\"
+                healthcheck:
+                  test: [\"CMD\", \"wget\", \"-qO-\", \"http://localhost:8001/health\"]
+                  interval: 30s
+                  timeout: 3s
+                  retries: 3
+
+              tunnel:
+                image: cloudflare/cloudflared:latest
+                container_name: games-tunnel
+                restart: unless-stopped
+                command: tunnel --no-autoupdate run
+                environment:
+                  - TUNNEL_TOKEN=\${TUNNEL_TOKEN}' > ${{ env.APP_DIR }}/docker-compose.yml
+
+            echo '${{ secrets.GHCR_PAT }}' | docker login ghcr.io -u ${{ github.repository_owner }} --password-stdin
+            docker compose -f ${{ env.APP_DIR }}/docker-compose.yml pull
+            docker compose -f ${{ env.APP_DIR }}/docker-compose.yml up -d
+            echo 'Verifying container...'
+            docker ps --filter name=games --format '{{.Status}}'
+          "
+          echo "Deploy complete"
+
+      - name: Verify health
+        run: |
+          sleep 15
+          tailscale ssh "${{ env.PI_USER }}@${{ env.PI_HOSTNAME }}" "
+            CONTAINER=games
+            status=\$(docker inspect -f '{{.State.Status}}' \$CONTAINER 2>/dev/null)
+            restart_count=\$(docker inspect -f '{{.RestartCount}}' \$CONTAINER 2>/dev/null)
+            echo \"Container status: \$status\"
+            echo \"Restart count: \$restart_count\"
+            if [ \"\$status\" != \"running\" ]; then
+              echo 'ERROR: Container is not running'
+              docker logs \$CONTAINER --tail 20
+              exit 1
+            fi
+            if [ \"\$restart_count\" -gt 3 ]; then
+              echo 'ERROR: Container in restart loop'
+              docker logs \$CONTAINER --tail 20
+              exit 1
+            fi
+            echo 'App is healthy'
+          "
+
+      - name: Deployment summary
+        run: |
+          echo "=== Deployment Complete ==="
+          echo "Image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}"
+          echo "Target: ${{ env.PI_HOSTNAME }}"
+
+      - name: Dry-run summary
+        if: github.event.inputs.dry_run == 'true'
+        run: |
+          echo "=== DRY RUN - No changes made ==="
+          echo ""
+          echo "Would create tag: ${{ steps.version.outputs.release_tag }}"
+          if [ -n "${{ github.event.inputs.version_override }}" ]; then
+            echo "Version source: manual override (${{ github.event.inputs.version_override }})"
+          fi
+          echo "Would create GitHub release with categorized notes"
+          echo "Would build Docker image and push to GHCR with tags:"
+          echo "  - ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo "  - ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}"
+          echo "Would deploy to Pi (${{ env.PI_HOSTNAME }}) via Tailscale SSH"
+          echo ""
+          echo "Release notes preview:"
+          echo "---"
+          cat "${{ steps.notes.outputs.file }}"
+          echo "---"

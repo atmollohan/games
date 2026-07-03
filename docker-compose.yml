@@ -1,0 +1,23 @@
+services:
+  games:
+    image: ghcr.io/atmollohan/games:latest
+    container_name: games
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    networks:
+      - games-net
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: games-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    networks:
+      - games-net
+
+networks:
+  games-net:
+    driver: bridge
