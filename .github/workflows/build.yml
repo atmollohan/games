@@ -21,7 +21,7 @@ jobs:
       short_sha: ${{ steps.prep.outputs.short_sha }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
