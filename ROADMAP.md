@@ -26,10 +26,10 @@
 - [ ] Sound effects (Web Audio API)
 
 ## Phase 4 — Deployment
-- [ ] Deploy to RPi3 via Docker (Tailscale network)
-- [ ] Cloudflare Tunnel (cloudflared) for public ingress
+- [x] Deploy to RPi3 via Docker (Tailscale network)
+- [x] Cloudflare Tunnel (cloudflared) for public ingress
 - [ ] Graceful shutdown / signal handling
-- [ ] systemd unit or docker restart policy for reliability
+- [x] docker restart policy for reliability
 
 ## Phase 5 — Quality of Life
 - [ ] Logging middleware (access logs, optional structured logging)
